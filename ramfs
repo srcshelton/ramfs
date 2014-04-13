@@ -83,14 +83,22 @@ function usage() {
 		name="$( basename "${BASH_SOURCE:-${0}}" )"
 	fi
 
-	echo "${name} --unmount <path>"
-	echo "${name} --size <size> [--name <label>] [--filesystem <format>]" \
+#amfs  --unmount <path>
+#amfs  --size <size> [--name <label>] [--filesystem <format>] [--mount <path>]
+#     [--allow-suid]
+#       'size' may be expressed in IEC units, e.g. 512M, 2G, etc.
+#       'path' will be created if it does not exist, but should be empty
+#     To view the available filesystem formats, use 'format' "help"
+#
+	echo "${name}  --unmount <path>"
+	echo "${name}  --size <size> [--name <label>] [--filesystem <format>]" \
 		"[--mount <path>]"
-	echo "${name//?/ }  'size' may be expressed in IEC units, e.g. 512M, 2G," \
-		"etc."
-	echo "${name//?/ }  'path' will be created if it does not exist, but" \
+	echo "${name//?/ } [--allow-suid]"
+	echo "${name//?/ }   'size' may be expressed in IEC units, e.g. 512M," \
+		"2G, etc."
+	echo "${name//?/ }   'path' will be created if it does not exist, but" \
 		"should be empty"
-	echo "${name//?/ }   to view the available filesystem formats, use" \
+	echo "${name//?/ } To view the available filesystem formats, use" \
 		"'format' \"help\""
 
 	return 0
@@ -101,6 +109,8 @@ function attach() {
 	local mp="${1:-}" ; shift
 	local name="${1:-}" ; shift
 	local fs="${1:-}" ; shift
+	local -i suid="${1:-0}" ; shift
+	local -i squash="${1:-1}" ; shift
 
 	local -i totalsize=$( sysctl hw.memsize | cut -d' ' -f 2 )
 	local -i wiredsize=$(( $(
@@ -163,7 +173,7 @@ function attach() {
 		else
 			local -i writable=0
 			local parent="${mp}"
-	
+
 			while [[ "${parent}" != '/' && "${parent}" != '.' ]]; do
 				parent="$( dirname "${parent}" )"
 				if [[ -e "${parent}" ]]; then
@@ -184,7 +194,7 @@ function attach() {
 					fi
 				fi
 			done
-	
+
 			if ! (( writable )); then
 				echo >&2 "ERROR: Could not locate writable parent directory" \
 					"for '${mp}'"
@@ -210,7 +220,7 @@ function attach() {
 			numfmt --from=none --to=iec-i <<<"${reqsize}"
 		)B (${blocks} 512k blocks) ... "
 	local device="$(
-		  hdiutil attach -mount suppressed ram://${blocks} 2>/dev/null \
+		  hdiutil attach -mount suppressed -owners on ram://${blocks} 2>/dev/null \
 		| $sed $sedopt "s/^${space}+// ; s/${space}+$//"
 	)"
 	if ! [[ "${device:-}" =~ ^/dev/disk[0-9]+$ ]]; then
@@ -264,8 +274,79 @@ function attach() {
 			| bunzip2 -c > "${mp}"/.VolumeIcon.icns
 			SetFile -a C "${mp}"/
 		fi
-		touch "${mp}"/.metadata_never_index >/dev/null 2>&1
-		touch "${mp}"/.fseventsd/no_log >/dev/null 2>&1
+		{
+			touch "${mp}"/.metadata_never_index
+			touch "${mp}"/.fseventsd/no_log
+
+			mkdir "${mp}"/tmp
+			chmod 1777 "${mp}"/tmp
+			chflags hidden "${mp}"/tmp
+			(( EUID )) || chown root:wheel "${mp}"/tmp
+		} >/dev/null 2>&1
+	fi
+
+	# Try to enable multi-user support, but don't be too concerned if this
+	# fails...
+	local flags=""
+	if (( EUID )); then
+		local notice=0
+
+		if (( suid )); then
+			echo >&2 -e "\nWARNING: Cannot enable 'suid' flag if not run as" \
+				"root"
+			notice=1
+		fi
+
+		if ! (( squash )); then
+			# If owners are enabled, then the user performing the mount can't
+			# write to the filesystem root!  As a hack, create a 'Contents'
+			# directory (with appropriate permissions) before enabling owner
+			# support.
+			#
+			# FIXME: Is there a way to have a non-root mount with owner
+			#        support?
+			#
+			mkdir "${mp}"/Contents
+			flags="${flags:+,}owners"
+
+			(( notice )) || echo >&2
+			echo >&2 "Please use the 'Contents' sub-directory to store" \
+				"data"
+			notice=1
+		fi
+
+		if ! (( notice )); then
+			echo >&2 -e "\nPlease run as root to enable multi-user or" \
+				"SUID support"
+		fi
+		unset notice
+	else
+		if (( suid )); then
+			flags+="${flags:+,}suid"
+		fi
+	fi
+
+	# This resets the mount-point owner (which is why we need Contents unless
+	# run as root), and setting 'suid' appears to also remove 'nodev'...
+	#
+	if [[ -n "${flags}" ]]; then
+		mount -u -o ${flags} "${device}"
+	fi
+
+	if ! (( EUID )); then
+		if ! (( squash )); then
+			# We could simply use SUDO_UID and SUDO_GID here (as 'sudo' will
+			# have clobbered our original UID, and UID==EUID at this point) but
+			# this does open us up to malfeasance on the part of the user, so
+			# at least this way we can confirm that the SUDO_UID ID does
+			# actually exist...
+			#
+			local -i uid="$( id ${SUDO_UID:-501} | grep -ow 'uid=[0-9]\+' | cut -d'=' -f 2 )"
+			local -i gid="$( id ${SUDO_UID:-501} | grep -ow 'gid=[0-9]\+' | cut -d'=' -f 2 )"
+			if (( uid || gid )); then
+				chown ${uid}:${gid} "${mp}"/.
+			fi
+		fi
 	fi
 
 	return ${rc}
@@ -346,7 +427,8 @@ function main() {
 	else
 		script="$( basename "${BASH_SOURCE:-${0}}" )"
 	fi
-	local size mp name fs
+	local fs mp name size
+	local -i suid=0 squash=1
 
 	declare OPTARG
 	declare -i OPTIND=1 OPTERR=1
@@ -355,7 +437,7 @@ function main() {
 	# error reporting.  Thereafter, a colon following a character indicates
 	# that a mandatory parameter is expected to follow this option.
 	#
-	local options=":hf:m:n:s:u-:"
+	local options=":haof:m:n:s:u-:"
 	local optchr value option
 	local -i rc=0
 
@@ -366,6 +448,12 @@ function main() {
 					help)
 						usage
 						return 0
+						;;
+					allow-suid|suid)
+						suid=1
+						;;
+					owners|enable-owners|multiuser|nosquash)
+						squash=0
 						;;
 					fs|filesystem)
 						value="${!OPTIND:-}"
@@ -458,6 +546,12 @@ function main() {
 				usage
 				return 0
 				;;
+			a)
+				suid=1
+				;;
+			o)
+				squash=0
+				;;
 			f)
 				value="${OPTARG}"
 				fs="${value}"
@@ -494,7 +588,8 @@ function main() {
 				;;
 			*)
 				if (( 1 != OPTERR )) || [[ "${options:0:1}" == ":" ]]; then
-					echo >&2 "${script}: Required argument missing or unknown option '-${OPTARG}'"
+					echo >&2 "${script}: Required argument missing or" \
+						"unknown option '-${OPTARG}'"
 					rc=1
 				fi
 				;;
@@ -526,7 +621,8 @@ function main() {
 
 	name="${name:-${DEFAULT_NAME:-}}"
 	fs="${fs:-${DEFAULT_FS:-}}"
-	attach "${size:-}" "${mp:-}" "${name:-}" "${fs:-}"
+	attach "${size:-}" "${mp:-}" "${name:-}" "${fs:-}" \
+		"${suid:-0}" "${squash:-1}"
 
 	return ${?}
 } # main
