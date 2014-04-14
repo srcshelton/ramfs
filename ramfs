@@ -93,7 +93,7 @@ function usage() {
 	echo "${name}  --unmount <path>"
 	echo "${name}  --size <size> [--name <label>] [--filesystem <format>]" \
 		"[--mount <path>]"
-	echo "${name//?/ } [--allow-suid]"
+	echo "${name//?/ } [--allow-suid] [--enable-owners]"
 	echo "${name//?/ }   'size' may be expressed in IEC units, e.g. 512M," \
 		"2G, etc."
 	echo "${name//?/ }   'path' will be created if it does not exist, but" \
@@ -220,7 +220,7 @@ function attach() {
 			numfmt --from=none --to=iec-i <<<"${reqsize}"
 		)B (${blocks} 512k blocks) ... "
 	local device="$(
-		  hdiutil attach -mount suppressed -owners on ram://${blocks} 2>/dev/null \
+		  hdiutil attach -mount suppressed ram://${blocks} 2>/dev/null \
 		| $sed $sedopt "s/^${space}+// ; s/${space}+$//"
 	)"
 	if ! [[ "${device:-}" =~ ^/dev/disk[0-9]+$ ]]; then
@@ -255,7 +255,7 @@ function attach() {
 		&& echo "[  OK  ]" \
 		|| { echo "[ FAIL ]" ; false ; }
 	(( rc = ${?} ))
-	(( debug || rc )) && echo -e "\n${output}"
+	(( debug || rc )) && [[ -n "${output:-}" ]] && echo -e "\n${output}"
 
 	local mp
 	mount | grep -q "^${device} on " && mp="$(
@@ -321,8 +321,14 @@ function attach() {
 		fi
 		unset notice
 	else
+		# If actualy fact, enabling either of these seems to remove
+		# 'nodev, nosuid, noowners', regardless of which is specified...
 		if (( suid )); then
 			flags+="${flags:+,}suid"
+		fi
+
+		if ! (( squash )); then
+			flags="${flags:+,}owners"
 		fi
 	fi
 
@@ -334,7 +340,7 @@ function attach() {
 	fi
 
 	if ! (( EUID )); then
-		if ! (( squash )); then
+		if (( suid || !( squash ) )); then
 			# We could simply use SUDO_UID and SUDO_GID here (as 'sudo' will
 			# have clobbered our original UID, and UID==EUID at this point) but
 			# this does open us up to malfeasance on the part of the user, so
@@ -633,7 +639,11 @@ requires numfmt || exit 1
 checkforgnused
 checkforgnub64
 
+(( trace )) && set -o xtrace
+
 main "${@}"
+
+(( trace )) && set +o xtrace
 
 exit ${?}
 
