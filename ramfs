@@ -22,22 +22,82 @@ declare sed='sed'
 declare sedopt='-r'
 declare b64='base64'
 declare b64opt='-d'
+declare numfmt='numfmt'
 
 set -u
 
+function print() {
+	if (( debug )); then
+		if [[ -n "${*:-}" ]]; then
+			printf 'DEBUG:   %s\n' "${*:-}"
+		else
+			printf '\n'
+		fi
+	fi
+
+	return $(( ! debug ))
+} # print
+
+function warn() {
+	if [[ -n "${*:-}" ]]; then
+		printf 'WARNING: %s\n' "${*:-}"
+	else
+		printf '\n'
+	fi
+} # warn
+
+function error() {
+	if [[ -n "${*:-}" ]]; then
+		printf 'ERROR:   %s\n' "${*:-}" >&2
+	else
+		printf '\n' >&2
+	fi
+} # error
+
+function fatal() {
+	if [[ -n "${*:-}" ]]; then
+		printf 'FATAL:   %s\n' "${*:-}" >&2
+	else
+		printf '\n' >&2
+	fi
+} # fatal
+
 function requires() {
-	local files="${@:-}"
+	local files="${*:-}"
 	local item
-	local -i rc=0
+	local -i or=0 rc=0
 
 	[[ -n "${files:-}" ]] || return 1
 
+	if [[ "${1}" =~ -?-or? ]]; then
+		shift
+		if ! [[ -n "${1:-}" ]]; then
+			return 1
+		elif ! [[ -n "${1:-}" && -n "${2:-}" ]]; then
+			print "Disabling 'or' functionality with only two parameters"
+		else
+			files="${*:-}"
+			or=1
+		fi
+	fi
+
 	for item in ${files}; do
-		type -pf "${item}" >/dev/null 2>&1 || {
-			echo >&2 "FATAL: Cannot locate required '${item}' binary"
+		if type -pf "${item}" >/dev/null 2>&1; then
+			if (( or )); then
+				type -pf "${item}"
+				return 0
+			fi
+		else
+			fatal "Cannot locate required '${item}' binary"
 			rc=1
-		}
+		fi
 	done
+
+	if (( or )); then
+		fatal "Cannot locate required binary from '${files// /', '}'" |
+			rev | sed "s/' ,'/' ro '/" | rev >&2
+		rc=1
+	fi
 
 	return ${rc}
 } # requires
@@ -75,7 +135,6 @@ function checkforgnub64() {
 } # checkforgnub64
 
 function usage() {
-	#local name="$( basename "$( readlink -e "${BASH_SOURCE:-${0}}" )" )"
 	local name
 	if readlink --version >/dev/null 2>&1; then
 		name="$( basename "$( readlink -e "${BASH_SOURCE:-${0}}" )" )"
@@ -112,8 +171,9 @@ function attach() {
 	local -i suid="${1:-0}" ; shift
 	local -i squash="${1:-1}" ; shift
 
-	local -i totalsize=$( sysctl hw.memsize | cut -d' ' -f 2 )
-	local -i wiredsize=$(( $(
+	local -i totalsize wiredsize reqsize
+	totalsize=$( sysctl hw.memsize | cut -d' ' -f 2 )
+	wiredsize=$(( $(
 		  vm_stat \
 		| grep '^Pages wired down:' \
 		| grep -o '[0-9]\+\.$' \
@@ -123,38 +183,37 @@ function attach() {
 		| grep -o 'page size of [0-9]\+ bytes' \
 		| cut -d' ' -f 4
 		) ))
-	local -i reqsize=$( numfmt --from=si --to=none <<<"${size}" ) || {
-		echo >&2 "ERROR: Unable to convert '${size}' from SI size to" \
-			"numeric value"
+	if ! reqsize=$( ${numfmt} --from=si --to=none <<<"${size}" ); then
+		error "Unable to convert '${size}' from SI size to numeric value"
 		rc=1
-	}
+	fi
 	if (( reqsize >= totalsize )); then
-		echo >&2 "ERROR: Requested memory size ($(
-				numfmt --from=none --to=iec <<<"${reqsize}"
+		error "Requested memory size ($(
+				${numfmt} --from=none --to=iec <<<"${reqsize}"
 			)) is greater than the total amount of physical memory present" \
 				"on this host ($(
-					numfmt --from=none --to=iec <<<"${totalsize}"
+					${numfmt} --from=none --to=iec <<<"${totalsize}"
 				))"
 		rc=1
 	fi
 	if (( reqsize >= ( totalsize - wiredsize ) )); then
-		echo >&2 "ERROR: Requested memory size ($(
-				numfmt --from=none --to=iec <<<"${reqsize}"
+		error "Requested memory size ($(
+				${numfmt} --from=none --to=iec <<<"${reqsize}"
 			)) is greater than the amount of non-wired memory present" \
 				"on this host ($(
-					numfmt --from=none --to=iec <<<"$(( totalsize - wiredsize ))"
+					${numfmt} --from=none --to=iec <<<"$(( totalsize - wiredsize ))"
 				))"
 		rc=1
 	fi
 	if (( reqsize < 128 << 20 )); then
-		echo >&2 "ERROR: Not creating ramdisk smaller than 128M in size"
+		error "Not creating ramdisk smaller than 128M in size"
 		rc=1
 	fi
 	unset wiredsize totalsize
 
 	(( rc )) && return 1
 
-	(( debug )) && echo >&2 "DEBUG: Accepting size of '${size}' (${reqsize})"
+	print "Accepting size of '${size}' (${reqsize})"
 
 	# If we're mounting beneath /Volumes/, Mac OS sorts everything out for us
 	#
@@ -163,11 +222,13 @@ function attach() {
 
 		if [[ -e "${mp}" ]]; then
 			if ! [[ -d "${mp}" ]]; then
-				echo >&2 "ERROR: '${mp}' exists but is not a directory"
+				error "'${mp}' exists but is not a directory"
 				return 1
 			else
-				if (( $( ls -1 "${mp}"/ | wc -l ) )); then
-					echo >&2 "WARNING: Directory '${mp}' is not empty"
+				if ((
+					$( find "${mp}"/ -mindepth 1 -maxdepth 1 -print | wc -l )
+				)); then
+					warn >&2 "Directory '${mp}' is not empty"
 				fi
 			fi
 		else
@@ -182,28 +243,26 @@ function attach() {
 							writable=1
 							break
 						else
-							echo >&2 "ERROR: Parent '${parent}' of specified" \
-								"directory '${mp}' exists but cannot be" \
-								"written to"
+							error "Parent '${parent}' of specified directory" \
+								"'${mp}' exists but cannot be written to"
 							return 1
 						fi
 					else
-						echo >&2 "ERROR: Parent '${parent}' of specified" \
-							"directory '${mp}' exists but is not a directory"
+						error "Parent '${parent}' of specified directory" \
+							"'${mp}' exists but is not a directory"
 						return 1
 					fi
 				fi
 			done
 
 			if ! (( writable )); then
-				echo >&2 "ERROR: Could not locate writable parent directory" \
-					"for '${mp}'"
+				error "Could not locate writable parent directory for '${mp}'"
 				return 1
 			else
-				mkdir -p "${mp}" >/dev/null 2>&1 || {
-					echo 2>&1 "ERROR: mkdir() on '${mp}' failed: ${?}"
+				if ! mkdir -p "${mp}" >/dev/null 2>&1; then
+					error "mkdir() on '${mp}' failed: ${?}"
 					return 1
-				}
+				fi
 			fi
 		fi
 	fi
@@ -212,20 +271,20 @@ function attach() {
 	unset com_apple_hdid_nokernel com_apple_hdid_kernel
 	unset com_apple_diskimages_insecureHTTP
 
-	local output
+	local output device
 	local -i blocks=$(( reqsize / 512 ))
 	echo -n "Creating ramdisk of $(
-			numfmt --from=none --to=si <<<"${reqsize}"
+			${numfmt} --from=none --to=si <<<"${reqsize}"
 		)B/$(
-			numfmt --from=none --to=iec-i <<<"${reqsize}"
+			${numfmt} --from=none --to=iec-i <<<"${reqsize}"
 		)B (${blocks} 512k blocks) ... "
-	local device="$(
+	device="$(
 		  hdiutil attach -mount suppressed ram://${blocks} 2>/dev/null \
-		| $sed $sedopt "s/^${space}+// ; s/${space}+$//"
+		| ${sed} ${sedopt} "s/^${space}+// ; s/${space}+$//"
 	)"
-	if ! [[ "${device:-}" =~ ^/dev/disk[0-9]+$ ]]; then
+	if ! [[ "${device:-}" =~ ^/dev/disk[0-9]+(s[0-9]+)?$ ]]; then
 		echo "[ FAIL ]"
-		echo >&2 "ERROR: Read unlikely device '${device:-}' for ramdisk"
+		fatal "Read unlikely device '${device:-}' for ramdisk"
 		[[ -n "${device:-}" ]] && detach "${device}"
 
 		return 1
@@ -234,15 +293,19 @@ function attach() {
 
 	if [[ -n "${mp:-}" ]]; then
 		echo -n "Mounting device '${device:-}' on '${mp}' ... "
-		output="$( diskutil mount -mountPoint "${mp}" "${device}" 2>&1 )" \
-			&& echo "[  OK  ]" \
-			|| { echo "[ FAIL ]" ; false ; }
+		if output="$( diskutil mount -mountPoint "${mp}" "${device}" 2>&1 )"
+		then
+			echo "[  OK  ]"
+		else
+			echo "[ FAIL ]"
+			false
+		fi
 		(( rc = ${?} ))
-		(( debug || rc )) && echo -e "\n${output}"
+		(( debug || rc )) && printf '\n%s\n' "${output}"
 
 		if (( rc )); then
-			echo >&2 "ERROR: Failed to mount '${device}' on '${mp}'"
-			detach "${device}"
+			error "Failed to mount '${device}' on '${mp}'"
+			(( debug )) || detach "${device}"
 
 			return 1
 		fi
@@ -251,38 +314,63 @@ function attach() {
 	echo -n "Formatting ramdisk '$( basename -- "${device}" )' with '${fs}'" \
 		"filesystem ... "
 	name="${name:-${DEFAULT_NAME}}"
-	ouput="$( diskutil eraseVolume "${fs}" "${name}" "${device}" 2>&1 )" \
-		&& echo "[  OK  ]" \
-		|| { echo "[ FAIL ]" ; false ; }
+	local command="diskutil eraseVolume \"${fs}\" \"${name}\" \"${device}\""
+	[[ "${fs}" =~ APFS ]] &&
+		command="diskutil partitionDisk \"${device}\" 1 GPT \"${fs}\" \"${name}\" 100%"
+	if output="$( eval "${command}" 2>&1 )"
+	then
+		echo "[  OK  ]"
+	else
+		echo "[ FAIL ]"
+		false
+	fi
 	(( rc = ${?} ))
-	(( debug || rc )) && [[ -n "${output:-}" ]] && echo -e "\n${output}"
+	(( debug || rc )) && [[ -n "${output:-}" ]] && printf '\n%s\n' "${output}"
+
+	if [[ "${fs}" =~ APFS ]]; then
+		# Awkwardly, APFS creates a new disk and so we need to adjust $device
+		local d
+		local -i n
+		d="$( ${sed} ${sedopt} 's/^(.*)[0-9]+$/\1/' <<<"${device}" )"
+		(( n = $( ${sed} ${sedopt} 's/^.*([0-9]+)$/\1/' <<<"${device}" ), n++ ))
+		if [[ -b "${d}${n}" ]]; then
+			print "Adjusting APFS device node from '${device}' to '${d}${n}s1'"
+			device="${d}${n}s1"
+		fi
+	fi
 
 	local mp
-	mount | grep -q "^${device} on " && mp="$(
-		  mount \
-		| grep "^${device} on " \
-		| cut -d' ' -f 3- \
-		| cut -d'(' -f 1 \
-		| $sed $sedopt "s/${space}+$//"
-	)"
-	if [[ -d "${mp:-}" ]]; then
-		if requires $b64 bzip2 bunzip2 SetFile > /dev/null 2>&1; then
-			  cat "${BASH_SOURCE:-${0}}" \
-			| grep '^# DATA: ' \
-			| sed 's/^# DATA: //' \
-			| $b64 $b64opt \
-			| bunzip2 -c > "${mp}"/.VolumeIcon.icns
-			SetFile -a C "${mp}"/
-		fi
-		{
-			touch "${mp}"/.metadata_never_index
-			touch "${mp}"/.fseventsd/no_log
+	if ! mount | grep -Eq "^${device}(s[0-9]+)? on "; then
+		fatal "Failed to confirm mount of '${device}'"
+		(( debug )) || detach "${device}"
 
-			mkdir "${mp}"/tmp
-			chmod 1777 "${mp}"/tmp
-			chflags hidden "${mp}"/tmp
-			(( EUID )) || chown root:wheel "${mp}"/tmp
-		} >/dev/null 2>&1
+		return 1
+	else
+		mp="$(
+			  mount \
+			| grep -E "^${device}(s[0-9]+)? on " \
+			| cut -d' ' -f 3- \
+			| cut -d'(' -f 1 \
+			| ${sed} ${sedopt} "s/${space}+$//"
+		)"
+		if [[ -d "${mp:-}" ]]; then
+			if requires ${b64} bzip2 bunzip2 SetFile > /dev/null 2>&1; then
+				  grep '^# DATA: ' "${BASH_SOURCE:-${0}}" \
+				| sed 's/^# DATA: //' \
+				| ${b64} ${b64opt} \
+				| bunzip2 -c > "${mp}"/.VolumeIcon.icns
+				SetFile -a C "${mp}"/
+			fi
+			{
+				touch "${mp}"/.metadata_never_index
+				touch "${mp}"/.fseventsd/no_log
+
+				mkdir "${mp}"/tmp
+				chmod 1777 "${mp}"/tmp
+				chflags hidden "${mp}"/tmp
+				(( EUID )) || chown root:wheel "${mp}"/tmp
+			} >/dev/null 2>&1
+		fi
 	fi
 
 	# Try to enable multi-user support, but don't be too concerned if this
@@ -292,8 +380,7 @@ function attach() {
 		local notice=0
 
 		if (( suid )); then
-			echo >&2 -e "\nWARNING: Cannot enable 'suid' flag if not run as" \
-				"root"
+			warn "\\nCannot enable 'suid' flag if not run as root"
 			notice=1
 		fi
 
@@ -316,7 +403,8 @@ function attach() {
 		fi
 
 		if ! (( notice )); then
-			echo >&2 -e "\nPlease run as root to enable multi-user or" \
+			echo >&2
+			echo >&2 "Please run as root to enable multi-user or" \
 				"SUID support"
 		fi
 		unset notice
@@ -347,10 +435,11 @@ function attach() {
 			# at least this way we can confirm that the SUDO_UID ID does
 			# actually exist...
 			#
-			local -i uid="$( id ${SUDO_UID:-501} | grep -ow 'uid=[0-9]\+' | cut -d'=' -f 2 )"
-			local -i gid="$( id ${SUDO_UID:-501} | grep -ow 'gid=[0-9]\+' | cut -d'=' -f 2 )"
+			local -i uid gid
+			uid="$( id "${SUDO_UID:-501}" | grep -ow 'uid=[0-9]\+' | cut -d'=' -f 2 )"
+			gid="$( id "${SUDO_UID:-501}" | grep -ow 'gid=[0-9]\+' | cut -d'=' -f 2 )"
 			if (( uid || gid )); then
-				chown ${uid}:${gid} "${mp}"/.
+				chown "${uid}:${gid}" "${mp}"/.
 			fi
 		fi
 	fi
@@ -363,62 +452,67 @@ function detach() {
 	local device output
 	local -i rc=0
 
-	[[ -n "${mp:-}" ]] || {
-		echo >&2 "ERROR: A device or path to unmount is required"
+	if [[ -z "${mp:-}" ]]; then
+		error "A device or path to unmount is required"
 		return 1
-	}
+	fi
+
+	# TODO: Examine 'diskutil list' output for "Physical Store" indicators for
+	#       APFS volumes, and recursively unmount.
 
 	if [[ "${mp}" =~ ^/dev/ ]]; then
 		device="${mp}"
-		mount | grep -q "^${device} on " || {
-			echo >&2 "WARNING: Specified device '${device}' does not appear" \
-				"to be mounted"
-		}
+		mount | grep -q "^${device} on " ||
+			warn >&2 "Specified device '${device}' does not appear to be" \
+				"mounted"
 		mp="$(
 			  mount \
 			| grep "^${device} on " \
 			| cut -d' ' -f 3- \
 			| cut -d'(' -f 1 \
-			| $sed $sedopt "s/${space}+$//"
+			| ${sed} ${sedopt} "s/${space}+$//"
 		)"
 		if [[ -n "${mp:-}" ]]; then
-			[[ -d "${mp}" ]] || {
-				echo >&2 "WARNING: Mount-point '${mp}' does not exist"
-			}
+			[[ -d "${mp}" ]] ||
+				warn >&2 "Mount-point '${mp}' does not exist"
 		fi
 	else
-		[[ -d "${mp}" ]] || {
-			echo >&2 "ERROR: Specified mount-point '${mp}' does not exist"
+		if ! [[ -d "${mp}" || -d /Volumes/"${mp}" ]]; then
+			error "Specified mount-point '${mp}' does not exist"
 			return 1
-		}
-		mount | grep -q " on ${mp%%/} " || {
-			echo >&2 "ERROR: Specified mount-point '${mp}' does not appear" \
-				"to be active"
+		fi
+		if ! mount | grep -Eq " on (/Volumes/)?${mp%%/} "; then
+			error "Specified mount-point '${mp}' does not appear to be active"
 			return 1
-		}
-		device="$( mount | grep " on ${mp%%/} " | cut -d' ' -f 1 )"
+		fi
+		device="$( mount | grep -E " on (/Volumes/)?${mp%%/} " | cut -d' ' -f 1 )"
 	fi
 
-	if ! [[ "${device}" =~ ^/dev/disk[0-9]+$ ]]; then
-		echo >&2 "ERROR: Read unlikely device '${device}' for mount-point" \
-			"'${mp}'"
+	if ! [[ "${device}" =~ ^/dev/disk[0-9]+(s[0-9]+)?$ ]]; then
+		fatal "Read unlikely device '${device}' for mount-point '${mp}'"
 		return 1
 	fi
 
 	if [[ -n "${mp:-}" ]]; then
 		echo -n "Unmounting device '${device}' from mount-point '${mp}' ... "
-		output="$( diskutil unmountDisk "${device}" 2>&1 )" \
-			&& echo "[  OK  ]" \
-			|| { echo "[ FAIL ]" ; false ; }
+		if output="$( diskutil unmountDisk "${device}" 2>&1 )"; then
+			echo "[  OK  ]"
+		else
+			echo "[ FAIL ]"
+			false
+		fi
 		(( rc = ${?} ))
-		(( debug || rc )) && echo -e "\n${output}"
+		(( debug || rc )) && printf '\n%s\n' "${output}"
 	fi
 	echo -n "Detaching device '${device}' ... "
-	output="$( hdiutil detach "${device}" 2>&1 )" \
-		&& echo "[  OK  ]" \
-		|| { echo "[ FAIL ]" ; false ; }
+	if output="$( hdiutil detach "${device}" 2>&1 )"; then
+		echo "[  OK  ]"
+	else
+		echo "[ FAIL ]"
+		false
+	fi
 	(( rc += ${?} ))
-	(( debug || rc )) && echo -e "\n${output}"
+	(( debug || rc )) && printf '\n%s\n' "${output}"
 
 	[[ -d "${mp}" ]] && rmdir "${mp}" >/dev/null 2>&1
 
@@ -447,6 +541,8 @@ function main() {
 	local optchr value option
 	local -i rc=0
 
+	# Variables passed to 'getopts' aren't expanded by shellcheck :(
+	# shellcheck disable=SC2214
 	while getopts -- "${options}" optchr; do
 		case "${optchr}" in
 			-)
@@ -465,64 +561,55 @@ function main() {
 						value="${!OPTIND:-}"
 						(( OPTIND++ ))
 						fs="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${OPTARG}', value: '${value:-}'"
+						print "Parsing option: '--${OPTARG}', value: '${value:-}'"
 						;;
 					fs=*|filesystem=*)
 						value="${OPTARG#*=}"
 						option="${OPTARG%=${value:-}}"
 						fs="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${option}', value: '${value:-}'"
+						print "Parsing option: '--${option}', value: '${value:-}'"
 						;;
 					mp|mount|mountpoint)
 						value="${!OPTIND:-}"
 						(( OPTIND++ ))
 						mp="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${OPTARG}', value: '${value:-}'"
+						print "Parsing option: '--${OPTARG}', value: '${value:-}'"
 						;;
 					mp=*|mount=*|mountpoint=*)
 						value="${OPTARG#*=}"
 						option="${OPTARG%=${value:-}}"
 						mp="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${option}', value: '${value:-}'"
+						print "Parsing option: '--${option}', value: '${value:-}'"
 						;;
 					name)
 						value="${!OPTIND:-}"
 						(( OPTIND++ ))
 						name="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${OPTARG}', value: '${value:-}'"
+						print "Parsing option: '--${OPTARG}', value: '${value:-}'"
 						;;
 					name=*)
 						value="${OPTARG#*=}"
 						option="${OPTARG%=${value:-}}"
 						name="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${option}', value: '${value:-}'"
+						print "Parsing option: '--${option}', value: '${value:-}'"
 						;;
 					size)
 						value="${!OPTIND:-}"
 						(( OPTIND++ ))
 						size="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${OPTARG}', value: '${value:-}'"
+						print "Parsing option: '--${OPTARG}', value: '${value:-}'"
 						;;
 					size=*)
 						value="${OPTARG#*=}"
 						option="${OPTARG%=${value:-}}"
 						size="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${option}', value: '${value:-}'"
+						print "Parsing option: '--${option}', value: '${value:-}'"
 						;;
 					umount|unmount|detach)
 						value="${!OPTIND:-}"
 						(( OPTIND++ ))
 						mp="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${OPTARG}', value: '${value:-}'"
+						print "Parsing option: '--${OPTARG}', value: '${value:-}'"
 
 						detach "${mp}"
 
@@ -532,8 +619,7 @@ function main() {
 						value="${OPTARG#*=}"
 						option="${OPTARG%=${value:-}}"
 						mp="${value:-}"
-						(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-							"'--${option}', value: '${value:-}'"
+						print "Parsing option: '--${option}', value: '${value:-}'"
 
 						detach "${mp}"
 
@@ -542,7 +628,7 @@ function main() {
 					*)
 						if (( 1 == OPTERR )) && [[ "${options:0:1}" != ":" ]]
 						then
-							echo >&2 "${script}: Unknown option '--${OPTARG}'"
+							warn >&2 "${script}: Unknown option '--${OPTARG}'"
 							rc=1
 						fi
 						;;
@@ -559,42 +645,37 @@ function main() {
 				squash=0
 				;;
 			f)
-				value="${OPTARG}"
-				fs="${value}"
-				(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-					"'-${optchr}', value: '${value}'"
+				value="${OPTARG:-}"
+				fs="${value:-}"
+				print " Parsing option: '-${optchr:-}', value: '${value:-}'"
 				;;
 			m)
-				value="${OPTARG}"
-				mp="${value}"
-				(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-					"'-${optchr}', value: '${value}'"
+				value="${OPTARG:-}"
+				mp="${value:-}"
+				print " Parsing option: '-${optchr:-}', value: '${value:-}'"
 				;;
 			n)
-				value="${OPTARG}"
-				name="${value}"
-				(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-					"'-${optchr}', value: '${value}'"
+				value="${OPTARG:-}"
+				name="${value:-}"
+				print " Parsing option: '-${optchr:-}', value: '${value:-}'"
 				;;
 			s)
-				value="${OPTARG}"
-				size="${value}"
-				(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-					"'-${optchr}', value: '${value}'"
+				value="${OPTARG:-}"
+				size="${value:-}"
+				print " Parsing option: '-${optchr:-}', value: '${value:-}'"
 				;;
 			u)
-				value="${OPTARG}"
-				mp="${value}"
-				(( debug )) && echo >&2 "DEBUG: Parsing option:" \
-					"'-${optchr}', value: '${value}'"
+				value="${OPTARG:-}"
+				mp="${value:-}"
+				print " Parsing option: '-${optchr:-}', value: '${value:-}'"
 
-				detach "${mp}"
+				detach "${mp:-${DEFAULT_PATH}/${DEFAULT_NAME}}"
 
 				return ${?}
 				;;
 			*)
 				if (( 1 != OPTERR )) || [[ "${options:0:1}" == ":" ]]; then
-					echo >&2 "${script}: Required argument missing or" \
+					warn >&2 "${script}: Required argument missing or" \
 						"unknown option '-${OPTARG}'"
 					rc=1
 				fi
@@ -603,23 +684,35 @@ function main() {
 	done
 	unset option value optchr options
 
-	[[ -n "${size:-}" ]] || {
+	if [[ -n "${fs:-}" && "${fs}" == "help" ]]; then
+		diskutil listFilesystems
+		return 0
+	fi
+
+	if [[ -z "${size:-}" ]]; then
 		usage
 		return 1
-	}
+	fi
 
 	if [[ -n "${fs:-}" ]]; then
 		if ! {
 			  diskutil listFilesystems \
 			| grep '(or)' \
 			| cut -d' ' -f 4
-			echo -e "HFS+\nExFAT\nMS-DOS"
-		} | grep -iqw "${fs}"; then
-			echo >&2 "ERROR: '${fs}' is not a recognised filesystem" \
-				"personality.  Recognised types are:"
-			echo >&2
+			  diskutil listFilesystems \
+			| grep '\s\s\+' \
+			| ${sed} ${sedopt} 's/\s\s+.*$//' \
+			| grep -Ev '^(PERSONALITY|)$' \
+			| sort \
+			| uniq
+			echo 'APFSX'
+		} | grep -Fiqw "${fs}"; then
+			error "'${fs}' is not a recognised filesystem personality. " \
+				"Recognised types are:\\n"
 			diskutil listFilesystems >&2
 			rc=1
+		elif [[ "${fs}" == 'APFSX' ]]; then
+			fs='Case-sensitive APFS'
 		fi
 	fi
 
@@ -634,14 +727,17 @@ function main() {
 } # main
 
 requires diskutil hdiutil || exit 1
-requires numfmt || exit 1
+if ! numfmt="$( requires --or numfmt gnumfmt )"; then
+	echo >&2 "       (Try installing Homebrew from https://brew.sh/?)"
+	exit 1
+fi
 
 checkforgnused
 checkforgnub64
 
 (( trace )) && set -o xtrace
 
-main "${@}"
+main "${@:-}"
 
 (( trace )) && set +o xtrace
 
@@ -1279,4 +1375,4 @@ exit ${?}
 # DATA: FhFzI+YckK9l/bHWEZReaAE3wlL9YUUci1BA7/+LuSKcKEh7bIdbg
 # End image data
 
-# vi: set ts=4:
+# vi: set ts=4 colorcolumn=80:
